@@ -1,0 +1,15 @@
+[package]
+name = "hyper-tls-api"
+version = "0.1.0"
+authors = ["Christian Blades <christian dot blades at gmail>"]
+
+[dependencies]
+tls-api = "0.1.19"
+hyper = "0.12.1"
+tokio-tls-api = "0.1.19"
+failure = "0.1.1"
+failure_derive = "0.1.0"
+serde = "1.0.66"
+serde_derive = "1.0.66"
+futures = "0.2.1"
+tokio-io = "0.1.6"
