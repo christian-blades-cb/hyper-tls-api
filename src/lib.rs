@@ -1,19 +1,18 @@
-extern crate failure;
+//extern crate failure;
 extern crate futures;
 extern crate hyper;
 extern crate tls_api;
+#[macro_use]
 extern crate tokio_io;
-extern crate tokio_tls_api;
 
-use failure::Error;
-use futures::{Future, Poll};
+// use failure::Error;
+use futures::{Async, Future, Poll};
 use hyper::client::connect::{Connect, Connected, Destination, HttpConnector};
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
-use tls_api::{TlsConnector, TlsConnectorBuilder};
+use tls_api::{HandshakeError, TlsAcceptor, TlsConnector, TlsConnectorBuilder};
 use tokio_io::{AsyncRead, AsyncWrite};
-use tokio_tls_api::TlsStream;
 
 #[derive(Clone)]
 pub struct HttpsConnector<T, S> {
@@ -27,7 +26,7 @@ impl<S: TlsConnector> HttpsConnector<HttpConnector, S> {
     /// Construct a new HttpsConnector
     ///
     /// Takes number of DNS worker threads
-    pub fn new(threads: usize) -> Result<Self, Error> {
+    pub fn new(threads: usize) -> Result<Self, io::Error> {
         let mut http = HttpConnector::new(threads);
         http.enforce_http(false);
         let tls = S::builder()?.build()?;
@@ -91,13 +90,12 @@ type BoxedFut<T> = Box<Future<Item = (MaybeHttpsStream<T>, Connected), Error = i
 
 pub struct HttpsConnecting<T>(BoxedFut<T>);
 
-impl<T> Future for HttpsConnecting<T> {
+impl<T> hyper::rt::Future for HttpsConnecting<T> {
     type Item = (MaybeHttpsStream<T>, Connected);
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let oh = self.0;
-        oh.poll()
+        self.0.poll()
     }
 }
 
@@ -161,19 +159,131 @@ impl<T: AsyncRead + AsyncWrite> AsyncRead for MaybeHttpsStream<T> {
     }
 }
 
-impl<T: AsyncWrite + AsyncRead> AsyncWrite for MaybeHttpsStream<T> {
+impl<T: AsyncWrite + AsyncRead> AsyncWrite for MaybeHttpsStream<T>
+where
+    T: 'static,
+{
     fn shutdown(&mut self) -> Poll<(), io::Error> {
         match *self {
-            MaybeHttpsStream::Http(ref mut s) => {
-                let f: () = s.shutdown();
-                f
-                //s.shutdown()
-            }
-            MaybeHttpsStream::Https(ref mut s) => {
-                let f: () = s.shutdown();
-                f
-                //s.shutdown()
-            }
+            MaybeHttpsStream::Http(ref mut s) => s.shutdown(),
+            MaybeHttpsStream::Https(ref mut s) => s.shutdown(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TlsStream<S> {
+    inner: tls_api::TlsStream<S>,
+}
+
+pub struct ConnectAsync<S> {
+    inner: MidHandshake<S>,
+}
+
+pub struct AcceptAsync<S> {
+    inner: MidHandshake<S>,
+}
+
+struct MidHandshake<S> {
+    inner: Option<Result<tls_api::TlsStream<S>, HandshakeError<S>>>,
+}
+
+impl<S> TlsStream<S> {
+    pub fn get_ref(&self) -> &tls_api::TlsStream<S> {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut tls_api::TlsStream<S> {
+        &mut self.inner
+    }
+}
+
+impl<S: Read + Write> Read for TlsStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Read + Write> Write for TlsStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite> AsyncRead for TlsStream<S> {}
+
+impl<S: AsyncRead + AsyncWrite + 'static> AsyncWrite for TlsStream<S> {
+    fn shutdown(&mut self) -> Poll<(), io::Error> {
+        try_nb!(self.inner.shutdown());
+        self.inner.get_mut().shutdown()
+    }
+}
+
+pub fn connect_async<C, S>(connector: &C, domain: &str, stream: S) -> ConnectAsync<S>
+where
+    S: io::Read + io::Write + fmt::Debug + Send + Sync + 'static,
+    C: TlsConnector,
+{
+    ConnectAsync {
+        inner: MidHandshake {
+            inner: Some(connector.connect(domain, stream)),
+        },
+    }
+}
+
+pub fn accept_async<A, S>(acceptor: &A, stream: S) -> AcceptAsync<S>
+where
+    S: io::Read + io::Write + fmt::Debug + Send + Sync + 'static,
+    A: TlsAcceptor,
+{
+    AcceptAsync {
+        inner: MidHandshake {
+            inner: Some(acceptor.accept(stream)),
+        },
+    }
+}
+
+// TODO: change this to AsyncRead/AsyncWrite on next major version
+impl<S: Read + Write + 'static> Future for ConnectAsync<S> {
+    type Item = TlsStream<S>;
+    type Error = tls_api::Error;
+
+    fn poll(&mut self) -> Poll<TlsStream<S>, tls_api::Error> {
+        self.inner.poll()
+    }
+}
+
+// TODO: change this to AsyncRead/AsyncWrite on next major version
+impl<S: Read + Write + 'static> Future for AcceptAsync<S> {
+    type Item = TlsStream<S>;
+    type Error = tls_api::Error;
+
+    fn poll(&mut self) -> Poll<TlsStream<S>, tls_api::Error> {
+        self.inner.poll()
+    }
+}
+
+// TODO: change this to AsyncRead/AsyncWrite on next major version
+impl<S: Read + Write + 'static> Future for MidHandshake<S> {
+    type Item = TlsStream<S>;
+    type Error = tls_api::Error;
+
+    fn poll(&mut self) -> Poll<TlsStream<S>, tls_api::Error> {
+        match self.inner.take().expect("cannot poll MidHandshake twice") {
+            Ok(stream) => Ok(TlsStream { inner: stream }.into()),
+            Err(HandshakeError::Failure(e)) => Err(e),
+            Err(HandshakeError::Interrupted(s)) => match s.handshake() {
+                Ok(stream) => Ok(TlsStream { inner: stream }.into()),
+                Err(HandshakeError::Failure(e)) => Err(e),
+                Err(HandshakeError::Interrupted(s)) => {
+                    self.inner = Some(Err(HandshakeError::Interrupted(s)));
+                    Ok(Async::NotReady)
+                }
+            },
         }
     }
 }
